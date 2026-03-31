@@ -21,6 +21,8 @@
 
 #include "P_OCSPStapling.h"
 
+#include "tsutil/Bravo.h"
+
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
 #include <openssl/asn1.h>
@@ -279,17 +281,38 @@ namespace
 
 // Cached info stored in SSL_CTX ex_info
 struct certinfo {
-  unsigned char   idx[20]; // Index in session cache SHA1 hash of certificate
-  TS_OCSP_CERTID *cid;     // Certificate ID for OCSP requests or nullptr if ID cannot be determined
-  char           *uri;     // Responder details
-  char           *certname;
-  char           *user_agent;
-  ink_mutex       stapling_mutex;
-  unsigned char   resp_der[MAX_STAPLING_DER];
-  unsigned int    resp_derlen;
-  bool            is_prefetched;
-  bool            is_expire;
-  time_t          expire_time;
+  unsigned char   idx[20]       = {};      // Index in session cache SHA1 hash of certificate
+  TS_OCSP_CERTID *cid           = nullptr; // Certificate ID for OCSP requests
+  char           *uri           = nullptr; // Responder details
+  char           *certname      = nullptr;
+  char           *user_agent    = nullptr;
+  bool            is_prefetched = false;
+
+  // OCSP response data, protected by resp_mutex.
+  // Readers take a shared lock; the updater takes an exclusive lock.
+  unsigned char                   resp_der[MAX_STAPLING_DER] = {};
+  unsigned int                    resp_derlen                = 0;
+  bool                            is_expire                  = true;
+  time_t                          expire_time                = 0;
+  mutable ts::bravo::shared_mutex resp_mutex;
+
+  ~certinfo()
+  {
+    if (cid) {
+      TS_OCSP_CERTID_free(cid);
+    }
+    if (uri) {
+      OPENSSL_free(uri);
+    }
+    ats_free(certname);
+    ats_free(user_agent);
+  }
+
+  certinfo()                            = default;
+  certinfo(const certinfo &)            = delete;
+  certinfo &operator=(const certinfo &) = delete;
+  certinfo(certinfo &&)                 = delete;
+  certinfo &operator=(certinfo &&)      = delete;
 };
 
 class HTTPRequest : public Continuation
@@ -736,16 +759,10 @@ certinfo_map_free(void * /*parent*/, void *ptr, CRYPTO_EX_DATA * /*ad*/, int /*i
   }
 
   for (auto &iter : *map) {
-    certinfo *cinf = iter.second;
-    if (cinf->uri) {
-      OPENSSL_free(cinf->uri);
-    }
-
-    ats_free(cinf->certname);
-    ats_free(cinf->user_agent);
-
-    ink_mutex_destroy(&cinf->stapling_mutex);
-    OPENSSL_free(cinf);
+#ifdef OPENSSL_IS_BORINGSSL
+    X509_free(iter.first);
+#endif
+    delete iter.second;
   }
   delete map;
 }
@@ -831,12 +848,13 @@ stapling_cache_response(TS_OCSP_RESPONSE *rsp, certinfo *cinf)
     return false;
   }
 
-  ink_mutex_acquire(&cinf->stapling_mutex);
-  memcpy(cinf->resp_der, resp_der, resp_derlen);
-  cinf->resp_derlen = resp_derlen;
-  cinf->is_expire   = false;
-  cinf->expire_time = time(nullptr) + SSLConfigParams::ssl_ocsp_cache_timeout;
-  ink_mutex_release(&cinf->stapling_mutex);
+  {
+    std::lock_guard lock(cinf->resp_mutex);
+    memcpy(cinf->resp_der, resp_der, resp_derlen);
+    cinf->resp_derlen = resp_derlen;
+    cinf->is_expire   = false;
+    cinf->expire_time = time(nullptr) + SSLConfigParams::ssl_ocsp_cache_timeout;
+  }
 
   Dbg(dbg_ctl_ssl_ocsp, "stapling_cache_response: success to cache response");
   return true;
@@ -860,28 +878,20 @@ ssl_stapling_init_cert(SSL_CTX *ctx, X509 *cert, const char *certname, const cha
     return false;
   }
 
+  bool map_is_new = false;
   if (!map) {
-    map = new certinfo_map;
+    map        = new certinfo_map;
+    map_is_new = true;
   }
-  certinfo *cinf = static_cast<certinfo *>(OPENSSL_malloc(sizeof(certinfo)));
-  if (!cinf) {
-    Error("error allocating memory for %s", certname);
-    delete map;
-    return false;
-  }
+  auto      cinf_ptr = std::make_unique<certinfo>();
+  certinfo *cinf     = cinf_ptr.get();
 
   // Initialize certinfo
-  cinf->cid      = nullptr;
-  cinf->uri      = nullptr;
   cinf->certname = ats_strdup(certname);
   if (SSLConfigParams::ssl_ocsp_user_agent != nullptr) {
     cinf->user_agent = ats_strdup(SSLConfigParams::ssl_ocsp_user_agent);
   }
-  cinf->resp_derlen = 0;
-  ink_mutex_init(&cinf->stapling_mutex);
   cinf->is_prefetched = rsp_file ? true : false;
-  cinf->is_expire     = true;
-  cinf->expire_time   = 0;
 
   if (cinf->is_prefetched) {
     Dbg(dbg_ctl_ssl_ocsp, "using OCSP prefetched response file %s", rsp_file);
@@ -949,24 +959,15 @@ ssl_stapling_init_cert(SSL_CTX *ctx, X509 *cert, const char *certname, const cha
   X509_up_ref(cert);
 #endif
 
-  map->insert(std::make_pair(cert, cinf));
+  map->insert(std::make_pair(cert, cinf_ptr.release()));
   SSL_CTX_set_ex_data(ctx, ssl_stapling_index, map);
 
   Note("successfully initialized stapling for %s into SSL_CTX: %p uri=%s", certname, ctx, cinf->uri);
   return true;
 
 err:
-  if (cinf->cid) {
-    TS_OCSP_CERTID_free(cinf->cid);
-  }
-
-  ats_free(cinf->certname);
-  ats_free(cinf->user_agent);
-
-  if (cinf) {
-    OPENSSL_free(cinf);
-  }
-  if (map) {
+  // cinf_ptr destructor handles certinfo member cleanup
+  if (map_is_new) {
     delete map;
   }
 
@@ -1327,11 +1328,14 @@ ocsp_update()
           if (map) {
             // Walk over all certs associated with this CTX
             for (auto &iter : *map) {
-              cinf = iter.second;
-              ink_mutex_acquire(&cinf->stapling_mutex);
+              cinf         = iter.second;
               current_time = time(nullptr);
-              if (cinf->resp_derlen == 0 || cinf->is_expire || cinf->expire_time < current_time) {
-                ink_mutex_release(&cinf->stapling_mutex);
+              bool needs_refresh;
+              {
+                ts::bravo::shared_lock lock(cinf->resp_mutex);
+                needs_refresh = cinf->resp_derlen == 0 || cinf->is_expire || cinf->expire_time < current_time;
+              }
+              if (needs_refresh) {
                 if (stapling_refresh_response(cinf, &resp)) {
                   Dbg(dbg_ctl_ssl_ocsp, "Successfully refreshed OCSP for %s certificate. url=%s", cinf->certname, cinf->uri);
                   Metrics::Counter::increment(ssl_rsb.ocsp_refreshed_cert);
@@ -1339,8 +1343,6 @@ ocsp_update()
                   Error("Failed to refresh OCSP for %s certificate. url=%s", cinf->certname, cinf->uri);
                   Metrics::Counter::increment(ssl_rsb.ocsp_refresh_cert_failure);
                 }
-              } else {
-                ink_mutex_release(&cinf->stapling_mutex);
               }
             }
           }
@@ -1370,56 +1372,69 @@ ssl_callback_ocsp_stapling(SSL *ssl, void *)
     return SSL_TLSEXT_ERR_NOACK;
   }
 
-  // Fetch the specific certificate used in this negotiation
-  X509 *cert = SSL_get_certificate(ssl);
-  if (!cert) {
-    Error("ssl_callback_ocsp_stapling: failed to get certificate");
-    return SSL_TLSEXT_ERR_NOACK;
-  }
-
   certinfo *cinf = nullptr;
-#if HAVE_NATIVE_DUAL_CERT_SUPPORT
-  certinfo_map::iterator iter = map->find(cert);
-  if (iter != map->end()) {
-    cinf = iter->second;
-  }
-#else
-  for (certinfo_map::iterator iter = map->begin(); iter != map->end(); ++iter) {
-    X509 *key = iter->first;
-    if (key == nullptr) {
-      continue;
+
+  // Fast path: if only one certificate in the map, skip SSL_get_certificate() lookup
+  if (map->size() == 1) {
+    cinf = map->begin()->second;
+  } else {
+    // Fetch the specific certificate used in this negotiation
+    X509 *cert = SSL_get_certificate(ssl);
+    if (!cert) {
+      Error("ssl_callback_ocsp_stapling: failed to get certificate");
+      return SSL_TLSEXT_ERR_NOACK;
     }
 
-    if (X509_cmp(key, cert) == 0) {
+#if HAVE_NATIVE_DUAL_CERT_SUPPORT
+    certinfo_map::iterator iter = map->find(cert);
+    if (iter != map->end()) {
       cinf = iter->second;
-      break;
     }
-  }
+#else
+    for (certinfo_map::iterator iter = map->begin(); iter != map->end(); ++iter) {
+      X509 *key = iter->first;
+      if (key == nullptr) {
+        continue;
+      }
+
+      if (X509_cmp(key, cert) == 0) {
+        cinf = iter->second;
+        break;
+      }
+    }
 #endif
+  }
 
   if (cinf == nullptr) {
     Error("ssl_callback_ocsp_stapling: failed to get certificate information for ssl=%p", ssl);
     return SSL_TLSEXT_ERR_NOACK;
   }
 
-  ink_mutex_acquire(&cinf->stapling_mutex);
-  time_t current_time = time(nullptr);
-  if ((cinf->resp_derlen == 0 || cinf->is_expire) || (cinf->expire_time < current_time && !cinf->is_prefetched)) {
-    ink_mutex_release(&cinf->stapling_mutex);
-    Error("ssl_callback_ocsp_stapling: failed to get certificate status for %s", cinf->certname);
-    return SSL_TLSEXT_ERR_NOACK;
-  } else {
-    unsigned char *p = static_cast<unsigned char *>(OPENSSL_malloc(cinf->resp_derlen));
-    if (p == nullptr) {
-      ink_mutex_release(&cinf->stapling_mutex);
-      Dbg(dbg_ctl_ssl_ocsp, "ssl_callback_ocsp_stapling: failed to allocate memory for %s", cinf->certname);
+  unsigned char resp_copy[MAX_STAPLING_DER];
+  unsigned int  resp_copylen;
+
+  {
+    ts::bravo::shared_lock lock(cinf->resp_mutex);
+
+    time_t current_time = time(nullptr);
+    if (cinf->resp_derlen == 0 || cinf->is_expire || (cinf->expire_time < current_time && !cinf->is_prefetched)) {
+      Error("ssl_callback_ocsp_stapling: failed to get certificate status for %s", cinf->certname);
       return SSL_TLSEXT_ERR_NOACK;
     }
-    memcpy(p, cinf->resp_der, cinf->resp_derlen);
-    ink_mutex_release(&cinf->stapling_mutex);
-    SSL_set_tlsext_status_ocsp_resp(ssl, p, cinf->resp_derlen);
-    Dbg(dbg_ctl_ssl_ocsp, "ssl_callback_ocsp_stapling: successfully got certificate status for %s", cinf->certname);
-    Dbg(dbg_ctl_ssl_ocsp, "is_prefetched:%d uri:%s", cinf->is_prefetched, cinf->uri);
-    return SSL_TLSEXT_ERR_OK;
+
+    resp_copylen = cinf->resp_derlen;
+    memcpy(resp_copy, cinf->resp_der, resp_copylen);
   }
+
+  unsigned char *p = static_cast<unsigned char *>(OPENSSL_malloc(resp_copylen));
+  if (p == nullptr) {
+    Dbg(dbg_ctl_ssl_ocsp, "ssl_callback_ocsp_stapling: failed to allocate memory for %s", cinf->certname);
+    return SSL_TLSEXT_ERR_NOACK;
+  }
+  memcpy(p, resp_copy, resp_copylen);
+  SSL_set_tlsext_status_ocsp_resp(ssl, p, resp_copylen);
+
+  Dbg(dbg_ctl_ssl_ocsp, "ssl_callback_ocsp_stapling: successfully got certificate status for %s", cinf->certname);
+  Dbg(dbg_ctl_ssl_ocsp, "is_prefetched:%d uri:%s", cinf->is_prefetched, cinf->uri);
+  return SSL_TLSEXT_ERR_OK;
 }
