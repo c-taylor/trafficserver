@@ -27,6 +27,10 @@
 #include "iocore/net/AsyncSignalEventIO.h"
 #include "tscore/ink_hrtime.h"
 
+#if defined(__linux__)
+#include <sched.h>
+#endif
+
 #if TS_USE_LINUX_IO_URING
 #include "iocore/io_uring/IO_URING.h"
 #endif
@@ -48,6 +52,9 @@ namespace
 DbgCtl dbg_ctl_inactivity_cop{"inactivity_cop"};
 DbgCtl dbg_ctl_inactivity_cop_check{"inactivity_cop_check"};
 DbgCtl dbg_ctl_inactivity_cop_verbose{"inactivity_cop_verbose"};
+#if defined(__linux__)
+DbgCtl dbg_ctl_iocore_net{"iocore_net"};
+#endif
 
 } // end anonymous namespace
 
@@ -200,3 +207,44 @@ initialize_thread_for_net(EThread *thread)
 #endif
   thread->ep = ep;
 }
+
+#if defined(__linux__)
+// Give each ET_NET thread its own kernel FD table (files_struct) so that
+// accept4/close no longer contend on a single shared spinlock.  Every FD
+// that was open at the time of the call is copied into the new private
+// table — the underlying kernel objects (struct file) are shared, so
+// cross-thread eventfd signalling and shared cache-disk FDs keep working.
+//
+// This must be scheduled AFTER start_HttpProxyServer() so that all
+// initialization FDs (eventfds, cache disks, DNS sockets, log files,
+// listen sockets, plugin FDs) are already in place.
+
+namespace
+{
+struct UnshareFilesCont : public Continuation {
+  int
+  mainEvent(int /* event ATS_UNUSED */, Event * /* e ATS_UNUSED */)
+  {
+    if (unshare(CLONE_FILES) < 0) {
+      Warning("ET_NET thread %d: unshare(CLONE_FILES) failed: %s", this_ethread()->id, strerror(errno));
+    } else {
+      Dbg(dbg_ctl_iocore_net, "ET_NET thread %d: FD table unshared", this_ethread()->id);
+    }
+    delete this;
+    return EVENT_DONE;
+  }
+
+  UnshareFilesCont() : Continuation(nullptr) { SET_HANDLER(&UnshareFilesCont::mainEvent); }
+};
+} // end anonymous namespace
+
+void
+unshare_et_net_fd_tables()
+{
+  int n = eventProcessor.thread_group[ET_NET]._count;
+  for (int i = 0; i < n; i++) {
+    eventProcessor.thread_group[ET_NET]._thread[i]->schedule_imm(new UnshareFilesCont());
+  }
+  Note("Scheduled unshare(CLONE_FILES) on %d ET_NET threads", n);
+}
+#endif
