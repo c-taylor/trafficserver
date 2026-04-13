@@ -898,9 +898,7 @@ CB_After_Cache_Init()
     // call accept on the ports now that the cache is initialized.
     Note("Enabling listen, cache initialization finished");
     start_HttpProxyServer();
-#if defined(__linux__)
-    unshare_et_net_fd_tables();
-#endif
+    exec_thr_late_init(); // Must be last call before emit_fully_initialized_message()
     emit_fully_initialized_message();
   }
 
@@ -2461,9 +2459,7 @@ main(int /* argc ATS_UNUSED */, const char **argv)
         // In either case we should not delay to accept the ports.
         Dbg(dbg_ctl_http_listen, "Not delaying listen");
         start_HttpProxyServer(); // PORTS_READY_HOOK called from in here
-#if defined(__linux__)
-        unshare_et_net_fd_tables();
-#endif
+        exec_thr_late_init();    // Must be last call before emit_fully_initialized_message()
         emit_fully_initialized_message();
       }
     }

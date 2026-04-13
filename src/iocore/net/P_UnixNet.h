@@ -39,9 +39,7 @@ NetHandler     *get_NetHandler(EThread *t);
 PollCont       *get_PollCont(EThread *t);
 PollDescriptor *get_PollDescriptor(EThread *t);
 
-#if defined(__linux__)
-void unshare_et_net_fd_tables();
-#endif
+void exec_thr_late_init();
 
 using NetContHandler = int (NetHandler::*)(int, void *);
 using uint32         = unsigned int;

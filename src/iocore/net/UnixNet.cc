@@ -52,9 +52,7 @@ namespace
 DbgCtl dbg_ctl_inactivity_cop{"inactivity_cop"};
 DbgCtl dbg_ctl_inactivity_cop_check{"inactivity_cop_check"};
 DbgCtl dbg_ctl_inactivity_cop_verbose{"inactivity_cop_verbose"};
-#if defined(__linux__)
 DbgCtl dbg_ctl_iocore_net{"iocore_net"};
-#endif
 
 } // end anonymous namespace
 
@@ -208,43 +206,53 @@ initialize_thread_for_net(EThread *thread)
   thread->ep = ep;
 }
 
-#if defined(__linux__)
-// Give each ET_NET thread its own kernel FD table (files_struct) so that
-// accept4/close no longer contend on a single shared spinlock.  Every FD
-// that was open at the time of the call is copied into the new private
-// table — the underlying kernel objects (struct file) are shared, so
-// cross-thread eventfd signalling and shared cache-disk FDs keep working.
+// Late-initialization continuation for ET_NET threads.  Runs on each
+// thread after start_HttpProxyServer() has created all listen sockets
+// and all initialization FDs (eventfds, cache disks, DNS sockets, log
+// files, plugin FDs) are in place.
 //
-// This must be scheduled AFTER start_HttpProxyServer() so that all
-// initialization FDs (eventfds, cache disks, DNS sockets, log files,
-// listen sockets, plugin FDs) are already in place.
+// On Linux, when accept is performed directly on ET_NET threads
+// (accept_threads == 0), this calls unshare(CLONE_FILES) to give each
+// thread its own private kernel FD table, eliminating spinlock
+// contention on accept4/close.  The underlying kernel objects
+// (struct file) are shared, so cross-thread eventfd signalling and
+// shared cache-disk FDs keep working.
+//
+// This is NOT safe with dedicated accept threads (accept_threads > 0)
+// because accepted sockets are created on the accept thread and handed
+// off to ET_NET by FD number — after unshare those FDs would not exist
+// in the ET_NET thread's private table.
 
 namespace
 {
-struct UnshareFilesCont : public Continuation {
+struct ExecThrLateCont : public Continuation {
   int
   mainEvent(int /* event ATS_UNUSED */, Event * /* e ATS_UNUSED */)
   {
-    if (unshare(CLONE_FILES) < 0) {
+#if defined(__linux__)
+    int accept_threads = RecGetRecordInt("proxy.config.accept_threads").value_or(0);
+    if (accept_threads > 0) {
+      Dbg(dbg_ctl_iocore_net, "ET_NET thread %d: skipping unshare (accept_threads=%d)", this_ethread()->id, accept_threads);
+    } else if (unshare(CLONE_FILES) < 0) {
       Warning("ET_NET thread %d: unshare(CLONE_FILES) failed: %s", this_ethread()->id, strerror(errno));
     } else {
       Dbg(dbg_ctl_iocore_net, "ET_NET thread %d: FD table unshared", this_ethread()->id);
     }
+#endif
     delete this;
     return EVENT_DONE;
   }
 
-  UnshareFilesCont() : Continuation(nullptr) { SET_HANDLER(&UnshareFilesCont::mainEvent); }
+  ExecThrLateCont() : Continuation(nullptr) { SET_HANDLER(&ExecThrLateCont::mainEvent); }
 };
 } // end anonymous namespace
 
 void
-unshare_et_net_fd_tables()
+exec_thr_late_init()
 {
   int n = eventProcessor.thread_group[ET_NET]._count;
   for (int i = 0; i < n; i++) {
-    eventProcessor.thread_group[ET_NET]._thread[i]->schedule_imm(new UnshareFilesCont());
+    eventProcessor.thread_group[ET_NET]._thread[i]->schedule_imm(new ExecThrLateCont());
   }
-  Note("Scheduled unshare(CLONE_FILES) on %d ET_NET threads", n);
+  Note("Scheduled exec_thr_late_init() on %d ET_NET threads", n);
 }
-#endif
