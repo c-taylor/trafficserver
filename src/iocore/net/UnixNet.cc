@@ -212,14 +212,19 @@ initialize_thread_for_net(EThread *thread)
 // start_HttpProxyServer() schedules accept_per_thread.
 //
 // On Linux, when per-thread listen is enabled (exec_thread.listen=1,
-// SO_REUSEPORT), this calls unshare(CLONE_FILES) to give each thread
-// its own private kernel FD table, eliminating spinlock contention on
-// accept4/close.  The subsequent do_listen() in accept_per_thread
-// creates the per-thread listen socket directly in the private table.
+// SO_REUSEPORT) and server session sharing uses per-thread pools,
+// this calls unshare(CLONE_FILES) to give each thread its own private
+// kernel FD table, eliminating spinlock contention on accept4/close.
+// The subsequent do_listen() in accept_per_thread creates the
+// per-thread listen socket directly in the private table.
 //
 // The underlying kernel objects (struct file) are shared, so
 // cross-thread eventfd signalling and shared cache-disk FDs keep
 // working.
+//
+// NOT safe with global/hybrid session sharing pools because
+// migrateToCurrentThread() transfers socket FDs by number — after
+// unshare those FDs do not exist in the target thread's private table.
 
 namespace
 {
@@ -230,7 +235,10 @@ struct ExecThrLateCont : public Continuation {
 #if defined(__linux__)
     int listen_per_thread = RecGetRecordInt("proxy.config.exec_thread.listen").value_or(0);
     if (listen_per_thread == 1) {
-      if (unshare(CLONE_FILES) < 0) {
+      auto pool = RecGetRecordStringAlloc("proxy.config.http.server_session_sharing.pool");
+      if (pool && *pool != "thread") {
+        Dbg(dbg_ctl_iocore_net, "ET_NET thread %d: skipping unshare (session pool=%s)", this_ethread()->id, pool->c_str());
+      } else if (unshare(CLONE_FILES) < 0) {
         Dbg(dbg_ctl_iocore_net, "ET_NET thread %d: unshare(CLONE_FILES) failed: %s", this_ethread()->id, strerror(errno));
       } else {
         Dbg(dbg_ctl_iocore_net, "ET_NET thread %d: FD table unshared", this_ethread()->id);
