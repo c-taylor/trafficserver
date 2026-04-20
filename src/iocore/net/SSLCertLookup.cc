@@ -238,7 +238,7 @@ SSLCertContext::SSLCertContext(SSLCertContext const &other)
   userconfig = other.userconfig;
   keyblock   = other.keyblock;
   ctx_type   = other.ctx_type;
-  ts::bravo::shared_lock lock(other.ctx_mutex);
+  std::shared_lock lock(other.ctx_mutex);
   ctx = other.ctx;
 }
 
@@ -250,7 +250,7 @@ SSLCertContext::operator=(SSLCertContext const &other)
     this->userconfig = other.userconfig;
     this->keyblock   = other.keyblock;
     this->ctx_type   = other.ctx_type;
-    ts::bravo::shared_lock lock(other.ctx_mutex);
+    std::shared_lock lock(other.ctx_mutex);
     this->ctx = other.ctx;
   }
   return *this;
@@ -259,7 +259,7 @@ SSLCertContext::operator=(SSLCertContext const &other)
 shared_SSL_CTX
 SSLCertContext::getCtx()
 {
-  ts::bravo::shared_lock lock(ctx_mutex);
+  std::shared_lock lock(ctx_mutex);
   return ctx;
 }
 
